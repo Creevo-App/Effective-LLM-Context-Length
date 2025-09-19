@@ -123,7 +123,13 @@ def load_dataset_from_file(path: str) -> List[QuestionRecord]:
     return records
 
 
-def load_dataset_from_hub(name: str, config: str, split: str) -> List[QuestionRecord]:
+def load_dataset_from_hub(
+    name: str,
+    config: str,
+    split: str,
+    *,
+    hf_token: Optional[str] = None,
+) -> List[QuestionRecord]:
     """Load the dataset from Hugging Face Hub using ``datasets``."""
 
     logging.info(
@@ -137,7 +143,30 @@ def load_dataset_from_hub(name: str, config: str, split: str) -> List[QuestionRe
             "Install it with `pip install datasets`."
         ) from exc
 
-    dataset = load_dataset(name, config, split=split)
+    # Allow passing a token for gated/private datasets via env or CLI.
+    # Prefer HF_TOKEN or HUGGINGFACE_TOKEN if present. CLI can override via --hf-token.
+    # Prefer explicit token passed from CLI; else check environment variables.
+    hf_token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    load_kwargs = {"split": split}
+    if hf_token:
+        # Newer datasets versions accept `token`; older accept `use_auth_token`.
+        load_kwargs["token"] = hf_token
+        load_kwargs["use_auth_token"] = hf_token
+
+    try:
+        dataset = load_dataset(name, config, **load_kwargs)
+    except TypeError:
+        # Fallback if only one of the parameters is supported
+        try:
+            dataset = load_dataset(name, config, split=split, token=hf_token)
+        except TypeError:
+            dataset = load_dataset(name, config, split=split, use_auth_token=hf_token)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load dataset from Hugging Face. "
+            "If the dataset is gated/private, set HF_TOKEN or HUGGINGFACE_TOKEN, "
+            "or pass a local file via --dataset-path. Original error: " + str(exc)
+        )
     records: List[QuestionRecord] = []
     for idx, row in enumerate(dataset):
         question = extract_field(row, QUESTION_FIELD_CANDIDATES)
@@ -455,6 +484,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Dataset split to use when loading from Hugging Face (default: test).",
     )
     parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN"),
+        help=(
+            "Optional Hugging Face access token for gated/private datasets. "
+            "Defaults to HF_TOKEN or HUGGINGFACE_TOKEN environment variables if set."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=None,
@@ -506,7 +544,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.dataset_path:
         records = load_dataset_from_file(args.dataset_path)
     else:
-        records = load_dataset_from_hub(args.dataset_name, args.dataset_config, args.dataset_split)
+        records = load_dataset_from_hub(
+            args.dataset_name,
+            args.dataset_config,
+            args.dataset_split,
+            hf_token=args.hf_token,
+        )
 
     if args.num_questions is not None:
         if args.num_questions <= 0:
