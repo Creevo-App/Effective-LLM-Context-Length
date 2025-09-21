@@ -1,0 +1,24 @@
+---
+alwaysApply: true
+description: "How to use the Python virtual environment for this project."
+---
+
+# Python Virtual Environment
+
+To avoid `ModuleNotFoundError` and other dependency issues, always use the Python interpreter from the project's virtual environment (`venv`).
+
+**Running Scripts:**
+Use the full path to the `python` executable within the `venv`:
+
+```bash
+/Users/mikil/Desktop/Desktop - Mikil’s MacBook Pro/SideProjects/Effective-LLM-Context-Length/venv/bin/python run_gemini_script.py
+```
+
+**Installing Packages:**
+Use the `pip` module with the `venv`'s Python interpreter:
+
+```bash
+/Users/mikil/Desktop/Desktop - Mikil’s MacBook Pro/SideProjects/Effective-LLM-Context-Length/venv/bin/python -m pip install <package_name>
+```
+
+**DO NOT** use global `python`, `python3`, or `pip` commands directly as they are not linked to this project's isolated environment.
