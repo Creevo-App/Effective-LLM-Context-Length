@@ -1,27 +1,26 @@
 import os
 import json
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 import time
 import random
 import string
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
-
-# Thread-local storage for models to avoid sharing across threads
+# Thread-local storage for clients to avoid sharing across threads
 thread_local = threading.local()
 
-def get_model():
-    """Get a thread-local model instance"""
-    if not hasattr(thread_local, 'model'):
-        thread_local.model = genai.GenerativeModel('gemini-2.5-flash')
-    return thread_local.model
+def get_client():
+    """Get a thread-local client instance"""
+    if not hasattr(thread_local, 'client'):
+        # The new API doesn't need explicit configuration, it uses environment variables
+        thread_local.client = genai.Client(api_key=GEMINI_API_KEY)
+    return thread_local.client
 
 # Load AIME 2025 dataset
 def load_dataset(file_path):
@@ -204,14 +203,19 @@ def process_problem(args):
     problem = item['problem']
     correct_answer = item['answer']
     
-    # Get thread-local model
-    model = get_model()
+    # Get thread-local client
+    client = get_client()
     
     try:
         # Create prompt and get model response
         prompt = create_math_prompt(problem, token_padding)
-        
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=1024)
+            )
+        )
         model_response = response.text
         
         # Extract answer
