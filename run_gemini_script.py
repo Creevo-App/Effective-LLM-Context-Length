@@ -229,7 +229,7 @@ def evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=8):
         print(f"{token_size:<15} {result['mean_accuracy']:<15.2%} {result['std_error']:<12.2%} {result['total_problems']:<10}")
     
     # Save comprehensive results to file
-    output_file = 'aime_2025_token_padding_evaluation_results.json'
+    output_file = 'gemini-2.5-flash/aime_2025_token_padding_evaluation_results.json'
     with open(output_file, 'w') as f:
         json.dump({
             'experiment_description': f'AIME 2025 evaluation with different token padding sizes ({num_runs} runs per problem-token combination)',
