@@ -107,116 +107,151 @@ Format your response with "Final Answer: [your integer answer]" at the end."""
     return prompt
 
 # Evaluate model on AIME dataset with different token padding sizes using multiprocessing
-def evaluate_aime_dataset_with_padding(dataset_path, max_workers=8):
+def evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=8):
     """Run Gemini model through AIME 2025 evaluation with different token padding sizes using multiprocessing"""
     print("Loading AIME 2025 dataset...")
     dataset = load_dataset(dataset_path)
     
     # Different token padding sizes to test
     token_sizes = [0, 256, 1024, 4096, 8192, 16384, 32_000, 64_000, 128_000, 256_000, 512_000]
-    all_results = {}
     
     total_problems = len(dataset)
+    total_tasks = total_problems * len(token_sizes) * num_runs
     print(f"Evaluating {total_problems} problems with {len(token_sizes)} different token padding sizes...")
+    print(f"Running {num_runs} times per problem-token combination = {total_tasks} total evaluations")
     print(f"Using multiprocessing with {max_workers} workers for parallel execution")
     
+    # Prepare all arguments for all problem-token-run combinations
+    all_args = []
+    for problem_index, item in enumerate(dataset):
+        for token_size in token_sizes:
+            for run_number in range(1, num_runs + 1):
+                all_args.append((item, token_size, problem_index, run_number))
+    
+    # Track results
+    raw_results = []
+    completed_count = 0
+    
+    print(f"\n{'='*80}")
+    print("STARTING PARALLEL EVALUATION OF ALL COMBINATIONS")
+    print(f"{'='*80}")
+    
+    # Use ThreadPoolExecutor for parallel processing of ALL combinations
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all problem-token-run combinations for processing
+        future_to_args = {executor.submit(process_problem_run, args): args for args in all_args}
+        
+        try:
+            # Process completed futures as they finish
+            for future in as_completed(future_to_args):
+                result = future.result()
+                raw_results.append(result)
+                completed_count += 1
+                
+                # Show progress
+                problem_index = result['problem_index']
+                problem_id = result['problem_id']
+                token_padding = result['token_padding']
+                run_number = result['run_number']
+                status_text = "✓" if result['is_correct'] else "✗"
+                if result.get('error'):
+                    status_text = "⚠"
+                
+                print(f"Completed {completed_count}/{total_tasks} | Problem {problem_index+1} | "
+                      f"Tokens: {token_padding} | Run: {run_number} | {status_text} | "
+                      f"Progress: {100*completed_count/total_tasks:.1f}%")
+                
+        except KeyboardInterrupt:
+            print(f"\n⚠️  Evaluation interrupted! Processed {completed_count}/{total_tasks} tasks.")
+            print("Cancelling remaining tasks...")
+            # Cancel all pending futures
+            for future in future_to_args:
+                future.cancel()
+            # Wait a bit for cancellations to process
+            time.sleep(1)
+    
+    # Aggregate results by token size
+    print(f"\n{'='*80}")
+    print("AGGREGATING RESULTS BY TOKEN SIZE")
+    print(f"{'='*80}")
+    
+    aggregated_results = {}
     for token_size in token_sizes:
-        print(f"\n{'='*60}")
-        print(f"EVALUATING WITH {token_size} TOKEN PADDING")
-        print(f"{'='*60}")
+        # Get all results for this token size
+        token_results = [r for r in raw_results if r['token_padding'] == token_size]
         
-        # Prepare arguments for all problems with this token size
-        problem_args = []
-        for i, item in enumerate(dataset):
-            problem_args.append((item, token_size, i, total_problems))
+        # Group by problem
+        problem_results = {}
+        for result in token_results:
+            problem_id = result['problem_id']
+            if problem_id not in problem_results:
+                problem_results[problem_id] = []
+            problem_results[problem_id].append(result)
         
-        results = []
-        correct_count = 0
-        completed_count = 0
+        # Calculate average accuracy per problem
+        problem_accuracies = []
+        for problem_id, results in problem_results.items():
+            correct_runs = sum(1 for r in results if r['is_correct'])
+            total_runs = len(results)
+            if total_runs > 0:
+                problem_accuracy = correct_runs / total_runs
+                problem_accuracies.append(problem_accuracy)
         
-        # Use ThreadPoolExecutor for parallel processing
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all problems for processing
-            future_to_problem = {executor.submit(process_problem, args): args for args in problem_args}
-            
-            try:
-                # Process completed futures as they finish
-                for future in as_completed(future_to_problem):
-                    result = future.result()
-                    results.append(result)
-                    completed_count += 1
-                    
-                    if result['is_correct']:
-                        correct_count += 1
-                    
-                    # Show progress with error indication
-                    problem_index = result['problem_index']
-                    problem_id = result['problem_id']
-                    status_text = "Correct ✓" if result['is_correct'] else "Wrong ✗"
-                    if result.get('error'):
-                        status_text = "Error ⚠"
-                    
-                    print(f"Completed {completed_count}/{total_problems} | Problem {problem_index+1} (ID: {problem_id}) | "
-                          f"Answer: {result['model_answer']} | {status_text} | "
-                          f"Running Accuracy: {correct_count}/{completed_count} ({100*correct_count/completed_count:.1f}%)")
-                    
-            except KeyboardInterrupt:
-                print(f"\n⚠️  Evaluation interrupted! Processed {completed_count}/{total_problems} problems.")
-                print("Cancelling remaining tasks...")
-                # Cancel all pending futures
-                for future in future_to_problem:
-                    future.cancel()
-                # Wait a bit for cancellations to process
-                time.sleep(1)
-                break
+        # Calculate overall statistics
+        if problem_accuracies:
+            mean_accuracy = sum(problem_accuracies) / len(problem_accuracies)
+            std_accuracy = (sum((acc - mean_accuracy) ** 2 for acc in problem_accuracies) / len(problem_accuracies)) ** 0.5
+            std_error = std_accuracy / (len(problem_accuracies) ** 0.5)
+        else:
+            mean_accuracy = std_accuracy = std_error = 0.0
         
-        # Sort results by problem index to maintain order
-        results.sort(key=lambda x: x['problem_index'])
-        
-        # Store results for this token size
-        accuracy = correct_count / total_problems
-        all_results[token_size] = {
-            'total_problems': total_problems,
-            'correct_count': correct_count,
-            'accuracy': accuracy,
-            'results': results
+        aggregated_results[token_size] = {
+            'mean_accuracy': mean_accuracy,
+            'std_accuracy': std_accuracy,
+            'std_error': std_error,
+            'total_problems': len(problem_accuracies),
+            'total_runs': len(token_results),
+            'problem_accuracies': problem_accuracies,
+            'raw_results': token_results
         }
         
-        print(f"\n=== RESULTS FOR {token_size} TOKEN PADDING ===")
-        print(f"Total Problems: {total_problems}")
-        print(f"Correct: {correct_count}")
-        print(f"Accuracy: {accuracy:.2%}")
+        print(f"Token Size {token_size}: {mean_accuracy:.2%} ± {std_error:.2%} (n={len(problem_accuracies)} problems)")
     
-    # Compare results across different token sizes
+    # Display comparison
     print(f"\n{'='*80}")
     print("COMPARISON ACROSS DIFFERENT TOKEN PADDING SIZES")
     print(f"{'='*80}")
-    print(f"{'Token Padding':<15} {'Correct':<10} {'Total':<8} {'Accuracy':<12}")
-    print("-" * 50)
+    print(f"{'Token Padding':<15} {'Mean Accuracy':<15} {'Std Error':<12} {'Problems':<10}")
+    print("-" * 60)
     
     for token_size in token_sizes:
-        result = all_results[token_size]
-        print(f"{token_size:<15} {result['correct_count']:<10} {result['total_problems']:<8} {result['accuracy']:<12.2%}")
+        result = aggregated_results[token_size]
+        print(f"{token_size:<15} {result['mean_accuracy']:<15.2%} {result['std_error']:<12.2%} {result['total_problems']:<10}")
     
     # Save comprehensive results to file
     output_file = 'aime_2025_token_padding_evaluation_results.json'
     with open(output_file, 'w') as f:
         json.dump({
-            'experiment_description': 'AIME 2025 evaluation with different token padding sizes (multiprocessed)',
+            'experiment_description': f'AIME 2025 evaluation with different token padding sizes ({num_runs} runs per problem-token combination)',
             'token_sizes_tested': token_sizes,
+            'num_runs': num_runs,
             'max_workers': max_workers,
+            'total_evaluations': len(raw_results),
             'summary_by_token_size': {
                 str(k): {
+                    'mean_accuracy': v['mean_accuracy'],
+                    'std_accuracy': v['std_accuracy'],
+                    'std_error': v['std_error'],
                     'total_problems': v['total_problems'],
-                    'correct_count': v['correct_count'],
-                    'accuracy': v['accuracy']
-                } for k, v in all_results.items()
+                    'total_runs': v['total_runs']
+                } for k, v in aggregated_results.items()
             },
-            'detailed_results': all_results
+            'raw_results': raw_results,
+            'aggregated_results': aggregated_results
         }, f, indent=2)
     
     print(f"\nDetailed results saved to {output_file}")
-    return all_results
+    return aggregated_results
 
 def extract_answer(response_text):
     """Extract the final answer from model response"""
@@ -236,10 +271,10 @@ def extract_answer(response_text):
     # If no number found, return None
     return None
 
-# Worker function for processing individual problems
-def process_problem(args):
-    """Process a single problem with given token padding"""
-    item, token_padding, problem_index, total_problems = args
+# Worker function for processing individual problem-token-run combinations
+def process_problem_run(args):
+    """Process a single problem with given token padding for a specific run"""
+    item, token_padding, problem_index, run_number = args
     
     problem_id = item['id']
     problem = item['problem']
@@ -266,6 +301,7 @@ def process_problem(args):
             'is_correct': is_correct,
             'token_padding': token_padding,
             'problem_index': problem_index,
+            'run_number': run_number,
             'error': None
         }
         
@@ -273,7 +309,7 @@ def process_problem(args):
         
     except Exception as e:
         error_msg = f"Failed after retries: {str(e)}"
-        logger.error(f"Problem {problem_id} with {token_padding} tokens failed: {error_msg}")
+        logger.error(f"Problem {problem_id} with {token_padding} tokens, run {run_number} failed: {error_msg}")
         return {
             'problem_id': problem_id,
             'problem': problem,
@@ -283,13 +319,14 @@ def process_problem(args):
             'is_correct': False,
             'token_padding': token_padding,
             'problem_index': problem_index,
+            'run_number': run_number,
             'error': error_msg
         }
 
 if __name__ == "__main__":
     try:
         dataset_path = "aime_2025_dataset.json"
-        evaluate_aime_dataset_with_padding(dataset_path, max_workers=128)
+        evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=16)
     except KeyboardInterrupt:
         print("\n🛑 Evaluation stopped by user.")
     except Exception as e:
