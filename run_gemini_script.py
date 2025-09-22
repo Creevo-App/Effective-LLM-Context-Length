@@ -8,9 +8,15 @@ import random
 import string
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Thread-local storage for clients to avoid sharing across threads
 thread_local = threading.local()
@@ -21,6 +27,27 @@ def get_client():
         # The new API doesn't need explicit configuration, it uses environment variables
         thread_local.client = genai.Client(api_key=GEMINI_API_KEY)
     return thread_local.client
+
+# Define retry decorator for API calls
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((Exception,))
+)
+def make_api_call_with_retry(client, prompt):
+    """Make API call with retry logic"""
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=1024)
+            )
+        )
+        return response.text
+    except Exception as e:
+        logger.warning(f"API call failed: {str(e)}. Retrying...")
+        raise
 
 # Load AIME 2025 dataset
 def load_dataset(file_path):
@@ -86,7 +113,7 @@ def evaluate_aime_dataset_with_padding(dataset_path, max_workers=8):
     dataset = load_dataset(dataset_path)
     
     # Different token padding sizes to test
-    token_sizes = [0, 256, 512, 1024, 2048]
+    token_sizes = [0, 256, 1024, 4096, 8192, 16384, 32_000, 64_000, 128_000, 256_000, 512_000]
     all_results = {}
     
     total_problems = len(dataset)
@@ -112,21 +139,36 @@ def evaluate_aime_dataset_with_padding(dataset_path, max_workers=8):
             # Submit all problems for processing
             future_to_problem = {executor.submit(process_problem, args): args for args in problem_args}
             
-            # Process completed futures as they finish
-            for future in as_completed(future_to_problem):
-                result = future.result()
-                results.append(result)
-                completed_count += 1
-                
-                if result['is_correct']:
-                    correct_count += 1
-                
-                # Show progress
-                problem_index = result['problem_index']
-                problem_id = result['problem_id']
-                print(f"Completed {completed_count}/{total_problems} | Problem {problem_index+1} (ID: {problem_id}) | "
-                      f"Answer: {result['model_answer']} | Correct: {'✓' if result['is_correct'] else '✗'} | "
-                      f"Running Accuracy: {correct_count}/{completed_count} ({100*correct_count/completed_count:.1f}%)")
+            try:
+                # Process completed futures as they finish
+                for future in as_completed(future_to_problem):
+                    result = future.result()
+                    results.append(result)
+                    completed_count += 1
+                    
+                    if result['is_correct']:
+                        correct_count += 1
+                    
+                    # Show progress with error indication
+                    problem_index = result['problem_index']
+                    problem_id = result['problem_id']
+                    status_text = "Correct ✓" if result['is_correct'] else "Wrong ✗"
+                    if result.get('error'):
+                        status_text = "Error ⚠"
+                    
+                    print(f"Completed {completed_count}/{total_problems} | Problem {problem_index+1} (ID: {problem_id}) | "
+                          f"Answer: {result['model_answer']} | {status_text} | "
+                          f"Running Accuracy: {correct_count}/{completed_count} ({100*correct_count/completed_count:.1f}%)")
+                    
+            except KeyboardInterrupt:
+                print(f"\n⚠️  Evaluation interrupted! Processed {completed_count}/{total_problems} problems.")
+                print("Cancelling remaining tasks...")
+                # Cancel all pending futures
+                for future in future_to_problem:
+                    future.cancel()
+                # Wait a bit for cancellations to process
+                time.sleep(1)
+                break
         
         # Sort results by problem index to maintain order
         results.sort(key=lambda x: x['problem_index'])
@@ -207,16 +249,9 @@ def process_problem(args):
     client = get_client()
     
     try:
-        # Create prompt and get model response
+        # Create prompt and get model response with retry logic
         prompt = create_math_prompt(problem, token_padding)
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_budget=1024)
-            )
-        )
-        model_response = response.text
+        model_response = make_api_call_with_retry(client, prompt)
         
         # Extract answer
         extracted_answer = extract_answer(model_response)
@@ -230,24 +265,35 @@ def process_problem(args):
             'model_answer': extracted_answer,
             'is_correct': is_correct,
             'token_padding': token_padding,
-            'problem_index': problem_index
+            'problem_index': problem_index,
+            'error': None
         }
         
         return result
         
     except Exception as e:
-        print(f"Error processing problem {problem_id} with {token_padding} tokens: {str(e)}")
+        error_msg = f"Failed after retries: {str(e)}"
+        logger.error(f"Problem {problem_id} with {token_padding} tokens failed: {error_msg}")
         return {
             'problem_id': problem_id,
             'problem': problem,
             'correct_answer': correct_answer,
-            'model_response': f"Error: {str(e)}",
+            'model_response': f"Error: {error_msg}",
             'model_answer': None,
             'is_correct': False,
             'token_padding': token_padding,
-            'problem_index': problem_index
+            'problem_index': problem_index,
+            'error': error_msg
         }
 
 if __name__ == "__main__":
-    dataset_path = "aime_2025_dataset.json"
-    evaluate_aime_dataset_with_padding(dataset_path, max_workers=16)
+    try:
+        dataset_path = "aime_2025_dataset.json"
+        evaluate_aime_dataset_with_padding(dataset_path, max_workers=128)
+    except KeyboardInterrupt:
+        print("\n🛑 Evaluation stopped by user.")
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        print(f"❌ Evaluation failed with error: {str(e)}")
+    finally:
+        print("👋 Evaluation session ended.")
