@@ -1,0 +1,42 @@
+---
+globs: visualize.py,*analysis*
+description: "Guidelines for data analysis and visualization in this project"
+---
+
+# Data Analysis Guidelines
+
+## Statistical Measures
+
+- **Mean Accuracy**: Average performance across multiple runs per problem
+- **Standard Error**: Standard deviation divided by sqrt(n) where n = number of problems
+- **Error Bars**: Always show 3× standard error for better visibility of confidence intervals
+- **Significance Testing**: Use z-test approximation for comparing against baseline
+
+## Visualization Standards
+
+### Line Charts
+
+- Use error shadows (fill_between) for confidence intervals
+- Log scale for x-axis when token sizes exceed 10,000
+- Professional styling with subtle backgrounds
+
+### Bar Charts
+
+- Include error bars on top of each bar
+- Value labels showing mean ± 3× standard error
+- Consistent color scheme across visualizations
+
+## File Organization
+
+Results are organized by model type:
+
+- Raw results: `{model}/aime_2025_token_padding_evaluation_results.json`
+- Line chart: `{model}/line_chart.png`
+- Bar chart: `{model}/bar_chart.png`
+
+## Key Metrics to Track
+
+1. **Optimal token padding size** (usually around 4096 tokens)
+2. **Performance degradation** with very large context (>100K tokens)
+3. **Statistical significance** of differences from baseline
+4. **Correlation** between token padding and accuracy

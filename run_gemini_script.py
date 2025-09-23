@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 # Thread-local storage for clients to avoid sharing across threads
 thread_local = threading.local()
 
+model = "gemini-2.5-pro"
+
 def get_client():
     """Get a thread-local client instance"""
     if not hasattr(thread_local, 'client'):
@@ -38,7 +40,7 @@ def make_api_call_with_retry(client, prompt):
     """Make API call with retry logic"""
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 thinking_config=types.ThinkingConfig(thinking_budget=1024)
@@ -113,7 +115,7 @@ def evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=8):
     dataset = load_dataset(dataset_path)
     
     # Different token padding sizes to test
-    token_sizes = [0, 256, 1024, 4096, 8192, 16384, 32_000, 64_000, 128_000, 256_000, 512_000]
+    token_sizes = [0, 256, 1024, 4096, 8192, 16384, 32_000, 64_000, 128_000, 256_000]
     
     total_problems = len(dataset)
     total_tasks = total_problems * len(token_sizes) * num_runs
@@ -229,7 +231,7 @@ def evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=8):
         print(f"{token_size:<15} {result['mean_accuracy']:<15.2%} {result['std_error']:<12.2%} {result['total_problems']:<10}")
     
     # Save comprehensive results to file
-    output_file = 'gemini-2.5-flash/aime_2025_token_padding_evaluation_results.json'
+    output_file = f'{model}/aime_2025_token_padding_evaluation_results.json'
     with open(output_file, 'w') as f:
         json.dump({
             'experiment_description': f'AIME 2025 evaluation with different token padding sizes ({num_runs} runs per problem-token combination)',
@@ -326,7 +328,7 @@ def process_problem_run(args):
 if __name__ == "__main__":
     try:
         dataset_path = "aime_2025_dataset.json"
-        evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=16)
+        evaluate_aime_dataset_with_padding(dataset_path, num_runs=10, max_workers=16)
     except KeyboardInterrupt:
         print("\n🛑 Evaluation stopped by user.")
     except Exception as e:

@@ -1,0 +1,35 @@
+---
+alwaysApply: true
+---
+
+# Project Structure Guide
+
+This project evaluates LLM performance on AIME mathematical problems with different context lengths (token padding).
+
+## Key Files
+
+- **[run_gemini_script.py](mdc:run_gemini_script.py)**: Main evaluation script that runs Gemini models through AIME problems with varying token padding
+- **[visualize.py](mdc:visualize.py)**: Visualization script that creates charts from evaluation results
+- **[aime_2025_dataset.json](mdc:aime_2025_dataset.json)**: AIME 2025 dataset with mathematical problems
+- **[download_aime_dataset.py](mdc:download_aime_dataset.py)**: Script to download the AIME dataset
+
+## Output Structure
+
+Results are organized by model in separate directories:
+
+- `gemini-2.5-flash/` - Results for Gemini 2.5 Flash model
+- `gemini-2.5-pro/` - Results for Gemini 2.5 Pro model
+
+Each model directory contains:
+
+- `aime_2025_token_padding_evaluation_results.json` - Raw evaluation results
+- `line_chart.png` - Line plot showing accuracy vs token padding
+- `bar_chart.png` - Bar chart showing performance comparison
+
+## Key Configuration
+
+The main script uses a `model` variable at the top to switch between different Gemini models:
+
+```python
+model = "gemini-2.5-pro"  # or "gemini-2.5-flash"
+```

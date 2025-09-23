@@ -1,0 +1,27 @@
+---
+description: "Workflow for running AIME evaluations and generating visualizations"
+---
+
+# AIME Evaluation Workflow
+
+## Running Evaluations
+
+1. **Set up environment**: Ensure you have a `.env` file with `GEMINI_API_KEY`
+2. **Choose model**: Edit the `model` variable in [run_gemini_script.py](mdc:run_gemini_script.py)
+3. **Run evaluation**: Execute the script using the virtual environment
+4. **Generate visualizations**: Use [visualize.py](mdc:visualize.py) to create charts
+
+## Evaluation Parameters
+
+- **Token sizes tested**: [0, 256, 1024, 4096, 8192, 16384, 32000, 64000, 128000, 256000, 512000]
+- **Runs per configuration**: 5 (configurable via `num_runs` parameter)
+- **Parallel workers**: 16 (configurable via `max_workers` parameter)
+- **Error bars**: Show 3× standard error for statistical significance
+
+## Key Features
+
+- **Multiprocessing**: Uses ThreadPoolExecutor for parallel evaluation
+- **Error handling**: Automatic retry logic with exponential backoff
+- **Progress tracking**: Real-time progress updates during evaluation
+- **Statistical analysis**: Calculates mean accuracy, standard error, and significance tests
+- **Robust visualization**: Line charts and bar charts with confidence intervals
