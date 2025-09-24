@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 # Thread-local storage for clients to avoid sharing across threads
 thread_local = threading.local()
 
-model = "gemini-2.5-pro"
+# Configuration parameters
+context = 'math'  # 'random' or 'math'
+model = "gemini-2.5-flash"
 
 def get_client():
     """Get a thread-local client instance"""
@@ -30,26 +32,119 @@ def get_client():
         thread_local.client = genai.Client(api_key=GEMINI_API_KEY)
     return thread_local.client
 
+# Global cache for math content and cached content objects
+math_content_cache = {}
+cached_content_objects = {}
+
+def load_math_content(num_words):
+    """Load math content from AOPS_Raw_Text.txt file"""
+    if num_words == 0:
+        return ""
+    
+    # Check cache first
+    if num_words in math_content_cache:
+        return math_content_cache[num_words]
+    
+    try:
+        with open('AOPS_Raw_Text.txt', 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Split into words and take the first num_words
+        words = content.split()
+        if len(words) >= num_words:
+            selected_words = words[:num_words]
+        else:
+            # If we need more words than available, repeat the content
+            repetitions = (num_words // len(words)) + 1
+            extended_words = (words * repetitions)[:num_words]
+            selected_words = extended_words
+        
+        math_text = " ".join(selected_words)
+        
+        # Cache the result
+        math_content_cache[num_words] = math_text
+        return math_text
+        
+    except FileNotFoundError:
+        logger.error("AOPS_Raw_Text.txt file not found. Falling back to random words.")
+        return generate_random_words(num_words)
+    except Exception as e:
+        logger.error(f"Error loading math content: {e}. Falling back to random words.")
+        return generate_random_words(num_words)
+
 # Define retry decorator for API calls
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     retry=retry_if_exception_type((Exception,))
 )
-def make_api_call_with_retry(client, prompt):
-    """Make API call with retry logic"""
+def make_api_call_with_retry(client, prompt, cached_content_name=None):
+    """Make API call with retry logic and optional caching"""
     try:
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=1024)
+        )
+        
+        # Add cached content if provided
+        if cached_content_name:
+            config.cached_content = cached_content_name
+        
         response = client.models.generate_content(
             model=model,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_budget=1024)
-            )
+            config=config
         )
         return response.text
     except Exception as e:
         logger.warning(f"API call failed: {str(e)}. Retrying...")
         raise
+
+def create_all_caches_upfront(token_sizes):
+    """Create all cached content upfront to reuse across workers"""
+    if context != 'math':
+        return
+        
+    logger.info("Creating cached content for math context...")
+    client = get_client()
+    
+    for token_padding in token_sizes:
+        if token_padding >= 1024:  # Only cache for sizes >= 1024 tokens (API requirement)
+            cache_key = f"{context}_{token_padding}"
+            
+            # Skip if already cached
+            if cache_key in cached_content_objects:
+                continue
+                
+            try:
+                context_text = load_math_content(token_padding)
+                
+                # Create cache with math content
+                cache = client.caches.create(
+                    model=model,
+                    config=types.CreateCachedContentConfig(
+                        display_name=f'math_context_{token_padding}_tokens',
+                        system_instruction=(
+                            'You are solving AIME (American Invitational Mathematics Examination) problems. '
+                            'AIME problems require integer answers between 0 and 999. '
+                            'The following mathematical content provides context for your reasoning.'
+                        ),
+                        contents=[
+                            types.Content(
+                                role="user", 
+                                parts=[types.Part(text=context_text)]
+                            )
+                        ],
+                        ttl="3600s",  # 1 hour TTL
+                    )
+                )
+                
+                cached_content_objects[cache_key] = cache.name
+                logger.info(f"Created cached content for {token_padding} tokens: {cache.name}")
+                
+            except Exception as e:
+                logger.error(f"Failed to create cached content for {token_padding} tokens: {e}")
+    
+    logger.info(f"Cached content creation complete. Created {len(cached_content_objects)} caches.")
 
 # Load AIME 2025 dataset
 def load_dataset(file_path):
@@ -57,6 +152,17 @@ def load_dataset(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
     return data
+
+# Generate context content based on context type
+def generate_context_content(num_words):
+    """Generate context content based on the global context setting"""
+    if num_words == 0:
+        return ""
+    
+    if context == 'math':
+        return load_math_content(num_words)
+    else:  # context == 'random'
+        return generate_random_words(num_words)
 
 # Generate random words for padding
 def generate_random_words(num_words):
@@ -93,84 +199,79 @@ def generate_random_words(num_words):
 
 # Create prompt for mathematical problem solving
 def create_math_prompt(problem, token_padding=0):
-    """Create a structured prompt for solving AIME problems with optional padding"""
-    # Add random word padding if specified
-    padding = ""
-    if token_padding > 0:
-        padding = generate_random_words(token_padding) + "\n\n"
-    
-    prompt = f"""{padding}You are solving an AIME (American Invitational Mathematics Examination) problem. 
+    """Create a structured prompt for solving AIME problems with optional context"""
+    if context == 'math' and token_padding >= 1024:
+        # For math context with caching (>=1024 tokens), just return the problem
+        prompt = f"""Problem: {problem}
+
+Please solve this step by step and provide your final answer as a single integer between 0 and 999.
+Format your response with "Final Answer: [your integer answer]" at the end."""
+    else:
+        # For random context, no padding, or small math context (<1024 tokens), include context directly in prompt
+        padding = ""
+        if token_padding > 0:
+            padding = generate_context_content(token_padding) + "\n\n"
+        
+        prompt = f"""{padding}You are solving an AIME (American Invitational Mathematics Examination) problem. 
 AIME problems require integer answers between 0 and 999.
 
 Problem: {problem}
 
 Please solve this step by step and provide your final answer as a single integer between 0 and 999.
 Format your response with "Final Answer: [your integer answer]" at the end."""
+    
     return prompt
 
-# Evaluate model on AIME dataset with different token padding sizes using multiprocessing
+# Evaluate model on AIME dataset with different token padding sizes using batch processing
 def evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=8):
-    """Run Gemini model through AIME 2025 evaluation with different token padding sizes using multiprocessing"""
+    """Run Gemini model through AIME 2025 evaluation with different token padding sizes using batch processing"""
     print("Loading AIME 2025 dataset...")
     dataset = load_dataset(dataset_path)
     
-    # Different token padding sizes to test
-    token_sizes = [0, 256, 1024, 4096, 8192, 16384, 32_000, 64_000, 128_000, 256_000]
+    # Different token padding sizes to test (limited to 128k)
+    token_sizes = [0, 256, 1024, 4096, 8192, 16384, 32_000, 64_000, 128_000]
     
     total_problems = len(dataset)
     total_tasks = total_problems * len(token_sizes) * num_runs
     print(f"Evaluating {total_problems} problems with {len(token_sizes)} different token padding sizes...")
     print(f"Running {num_runs} times per problem-token combination = {total_tasks} total evaluations")
-    print(f"Using multiprocessing with {max_workers} workers for parallel execution")
+    print(f"Processing in batches for efficiency")
     
-    # Prepare all arguments for all problem-token-run combinations
-    all_args = []
-    for problem_index, item in enumerate(dataset):
-        for token_size in token_sizes:
-            for run_number in range(1, num_runs + 1):
-                all_args.append((item, token_size, problem_index, run_number))
+    # Create all caches upfront to avoid duplicate cache creation
+    create_all_caches_upfront(token_sizes)
     
-    # Track results
+    print(f"\n{'='*80}")
+    print("STARTING BATCH EVALUATION OF ALL COMBINATIONS")
+    print(f"{'='*80}")
+    
+    # Process everything as batches by token size
     raw_results = []
     completed_count = 0
     
-    print(f"\n{'='*80}")
-    print("STARTING PARALLEL EVALUATION OF ALL COMBINATIONS")
-    print(f"{'='*80}")
-    
-    # Use ThreadPoolExecutor for parallel processing of ALL combinations
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all problem-token-run combinations for processing
-        future_to_args = {executor.submit(process_problem_run, args): args for args in all_args}
+    for token_size in token_sizes:
+        print(f"\nProcessing token size: {token_size}")
         
-        try:
-            # Process completed futures as they finish
-            for future in as_completed(future_to_args):
-                result = future.result()
-                raw_results.append(result)
-                completed_count += 1
-                
-                # Show progress
-                problem_index = result['problem_index']
-                problem_id = result['problem_id']
-                token_padding = result['token_padding']
-                run_number = result['run_number']
-                status_text = "✓" if result['is_correct'] else "✗"
-                if result.get('error'):
-                    status_text = "⚠"
-                
-                print(f"Completed {completed_count}/{total_tasks} | Problem {problem_index+1} | "
-                      f"Tokens: {token_padding} | Run: {run_number} | {status_text} | "
-                      f"Progress: {100*completed_count/total_tasks:.1f}%")
-                
-        except KeyboardInterrupt:
-            print(f"\n⚠️  Evaluation interrupted! Processed {completed_count}/{total_tasks} tasks.")
-            print("Cancelling remaining tasks...")
-            # Cancel all pending futures
-            for future in future_to_args:
-                future.cancel()
-            # Wait a bit for cancellations to process
-            time.sleep(1)
+        # Create batch of all problems for this token size
+        batch_prompts = []
+        batch_metadata = []
+        
+        for problem_index, item in enumerate(dataset):
+            for run_number in range(1, num_runs + 1):
+                prompt = create_math_prompt(item['problem'], token_size)
+                batch_prompts.append(prompt)
+                batch_metadata.append({
+                    'item': item,
+                    'token_padding': token_size,
+                    'problem_index': problem_index,
+                    'run_number': run_number
+                })
+        
+        # Process this batch
+        batch_results = process_batch(batch_prompts, batch_metadata, token_size)
+        raw_results.extend(batch_results)
+        completed_count += len(batch_results)
+        
+        print(f"Completed {completed_count}/{total_tasks} | Progress: {100*completed_count/total_tasks:.1f}%")
     
     # Aggregate results by token size
     print(f"\n{'='*80}")
@@ -231,14 +332,35 @@ def evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=8):
         print(f"{token_size:<15} {result['mean_accuracy']:<15.2%} {result['std_error']:<12.2%} {result['total_problems']:<10}")
     
     # Save comprehensive results to file
-    output_file = f'{model}/aime_2025_token_padding_evaluation_results.json'
+    output_dir = f'{model}_{context}'
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = f'{output_dir}/aime_2025_token_padding_evaluation_results.json'
+    
+    # Ensure the output directory exists and is writable
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        # Test write permissions by creating a temporary file
+        test_file = os.path.join(output_dir, '.write_test')
+        with open(test_file, 'w') as f:
+            f.write('test')
+        os.remove(test_file)
+    except Exception as e:
+        logger.error(f"Cannot create or write to output directory '{output_dir}': {e}")
+        # Fallback to current directory
+        output_dir = '.'
+        output_file = f'aime_2025_token_padding_evaluation_results_{model}_{context}.json'
+        logger.info(f"Falling back to current directory. Output file: {output_file}")
+    
     with open(output_file, 'w') as f:
         json.dump({
-            'experiment_description': f'AIME 2025 evaluation with different token padding sizes ({num_runs} runs per problem-token combination)',
+            'experiment_description': f'AIME 2025 evaluation with {context} context and different token padding sizes ({num_runs} runs per problem-token combination)',
+            'model': model,
+            'context_type': context,
             'token_sizes_tested': token_sizes,
             'num_runs': num_runs,
             'max_workers': max_workers,
             'total_evaluations': len(raw_results),
+            'caching_enabled': context == 'math',
             'summary_by_token_size': {
                 str(k): {
                     'mean_accuracy': v['mean_accuracy'],
@@ -273,57 +395,83 @@ def extract_answer(response_text):
     # If no number found, return None
     return None
 
-# Worker function for processing individual problem-token-run combinations
-def process_problem_run(args):
-    """Process a single problem with given token padding for a specific run"""
-    item, token_padding, problem_index, run_number = args
+# Batch processing function
+def process_batch(batch_prompts, batch_metadata, token_size):
+    """Process a batch of prompts for a given token size"""
+    results = []
     
-    problem_id = item['id']
-    problem = item['problem']
-    correct_answer = item['answer']
+    # Get cached content for this token size if applicable
+    cached_content_name = None
+    if context == 'math' and token_size >= 1024:
+        cache_key = f"{context}_{token_size}"
+        cached_content_name = cached_content_objects.get(cache_key)
     
-    # Get thread-local client
+    # Get client
     client = get_client()
     
-    try:
-        # Create prompt and get model response with retry logic
-        prompt = create_math_prompt(problem, token_padding)
-        model_response = make_api_call_with_retry(client, prompt)
-        
-        # Extract answer
-        extracted_answer = extract_answer(model_response)
-        is_correct = str(extracted_answer) == str(correct_answer)
-        
-        result = {
-            'problem_id': problem_id,
-            'problem': problem,
-            'correct_answer': correct_answer,
-            'model_response': model_response,
-            'model_answer': extracted_answer,
-            'is_correct': is_correct,
-            'token_padding': token_padding,
-            'problem_index': problem_index,
-            'run_number': run_number,
-            'error': None
-        }
-        
-        return result
-        
-    except Exception as e:
-        error_msg = f"Failed after retries: {str(e)}"
-        logger.error(f"Problem {problem_id} with {token_padding} tokens, run {run_number} failed: {error_msg}")
-        return {
-            'problem_id': problem_id,
-            'problem': problem,
-            'correct_answer': correct_answer,
-            'model_response': f"Error: {error_msg}",
-            'model_answer': None,
-            'is_correct': False,
-            'token_padding': token_padding,
-            'problem_index': problem_index,
-            'run_number': run_number,
-            'error': error_msg
-        }
+    print(f"  Processing {len(batch_prompts)} prompts for token size {token_size}...")
+    
+    # Process all prompts in this batch
+    for i, (prompt, metadata) in enumerate(zip(batch_prompts, batch_metadata)):
+        try:
+            item = metadata['item']
+            problem_id = item['id']
+            problem = item['problem']
+            correct_answer = item['answer']
+            token_padding = metadata['token_padding']
+            problem_index = metadata['problem_index']
+            run_number = metadata['run_number']
+            
+            # Get model response with retry logic
+            model_response = make_api_call_with_retry(client, prompt, cached_content_name)
+            
+            # Extract answer
+            extracted_answer = extract_answer(model_response)
+            is_correct = str(extracted_answer) == str(correct_answer)
+            
+            result = {
+                'problem_id': problem_id,
+                'problem': problem,
+                'correct_answer': correct_answer,
+                'model_response': model_response,
+                'model_answer': extracted_answer,
+                'is_correct': is_correct,
+                'token_padding': token_padding,
+                'problem_index': problem_index,
+                'run_number': run_number,
+                'context': context,
+                'cached_content_used': cached_content_name is not None,
+                'error': None
+            }
+            
+            results.append(result)
+            
+            # Show progress within batch
+            if (i + 1) % 10 == 0 or (i + 1) == len(batch_prompts):
+                status_text = "✓" if result['is_correct'] else "✗"
+                print(f"    Batch progress: {i+1}/{len(batch_prompts)} | Problem {problem_index+1} Run {run_number} | {status_text}")
+            
+        except Exception as e:
+            error_msg = f"Failed after retries: {str(e)}"
+            logger.error(f"Problem {problem_id} with {token_size} tokens, run {run_number} failed: {error_msg}")
+            
+            results.append({
+                'problem_id': item['id'],
+                'problem': item['problem'],
+                'correct_answer': item['answer'],
+                'model_response': f"Error: {error_msg}",
+                'model_answer': None,
+                'is_correct': False,
+                'token_padding': token_padding,
+                'problem_index': metadata['problem_index'],
+                'run_number': metadata['run_number'],
+                'context': context,
+                'cached_content_used': False,
+                'error': error_msg
+            })
+    
+    print(f"  Completed batch for token size {token_size}")
+    return results
 
 if __name__ == "__main__":
     try:
