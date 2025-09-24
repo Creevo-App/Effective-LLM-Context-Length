@@ -134,7 +134,7 @@ def create_all_caches_upfront(token_sizes):
                                 parts=[types.Part(text=context_text)]
                             )
                         ],
-                        ttl="3600s",  # 1 hour TTL
+                        ttl="10800s",  # 3 hour TTL
                     )
                 )
                 
@@ -222,9 +222,9 @@ Format your response with "Final Answer: [your integer answer]" at the end."""
     
     return prompt
 
-# Evaluate model on AIME dataset with different token padding sizes using batch processing
+# Evaluate model on AIME dataset with different token padding sizes using multiprocessing
 def evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=8):
-    """Run Gemini model through AIME 2025 evaluation with different token padding sizes using batch processing"""
+    """Run Gemini model through AIME 2025 evaluation with different token padding sizes using multiprocessing"""
     print("Loading AIME 2025 dataset...")
     dataset = load_dataset(dataset_path)
     
@@ -235,43 +235,42 @@ def evaluate_aime_dataset_with_padding(dataset_path, num_runs=5, max_workers=8):
     total_tasks = total_problems * len(token_sizes) * num_runs
     print(f"Evaluating {total_problems} problems with {len(token_sizes)} different token padding sizes...")
     print(f"Running {num_runs} times per problem-token combination = {total_tasks} total evaluations")
-    print(f"Processing in batches for efficiency")
+    print(f"Using multiprocessing with {max_workers} workers for parallel execution")
     
-    # Create all caches upfront to avoid duplicate cache creation
+    # Create all caches upfront to avoid duplicate cache creation in workers
     create_all_caches_upfront(token_sizes)
     
-    print(f"\n{'='*80}")
-    print("STARTING BATCH EVALUATION OF ALL COMBINATIONS")
-    print(f"{'='*80}")
-    
-    # Process everything as batches by token size
-    raw_results = []
-    completed_count = 0
-    
-    for token_size in token_sizes:
-        print(f"\nProcessing token size: {token_size}")
-        
-        # Create batch of all problems for this token size
-        batch_prompts = []
-        batch_metadata = []
-        
-        for problem_index, item in enumerate(dataset):
+    # Prepare all arguments for all problem-token-run combinations
+    print("Preparing task arguments...")
+    all_args = []
+    for problem_index, item in enumerate(dataset):
+        for token_padding in token_sizes:
             for run_number in range(1, num_runs + 1):
-                prompt = create_math_prompt(item['problem'], token_size)
-                batch_prompts.append(prompt)
-                batch_metadata.append({
-                    'item': item,
-                    'token_padding': token_size,
-                    'problem_index': problem_index,
-                    'run_number': run_number
-                })
+                all_args.append((item, token_padding, problem_index, run_number))
+    
+    print(f"Starting evaluation of {len(all_args)} total tasks...")
+    
+    # Process using ThreadPoolExecutor
+    raw_results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_args = {executor.submit(process_problem_run, args): args for args in all_args}
         
-        # Process this batch
-        batch_results = process_batch(batch_prompts, batch_metadata, token_size)
-        raw_results.extend(batch_results)
-        completed_count += len(batch_results)
-        
-        print(f"Completed {completed_count}/{total_tasks} | Progress: {100*completed_count/total_tasks:.1f}%")
+        # Process completed futures
+        for completed, future in enumerate(as_completed(future_to_args), 1):
+            try:
+                result = future.result()
+                raw_results.append(result)
+                
+                # Progress updates every 10 completions
+                if completed % 10 == 0:
+                    progress_percent = (completed / len(all_args)) * 100
+                    print(f"Progress: {completed}/{len(all_args)} ({progress_percent:.1f}%)")
+                    
+            except Exception as e:
+                args = future_to_args[future]
+                item, token_padding, problem_index, run_number = args
+                logger.error(f"Task failed: Problem {item['id']}, Token {token_padding}, Run {run_number}: {str(e)}")
     
     # Aggregate results by token size
     print(f"\n{'='*80}")
@@ -395,83 +394,71 @@ def extract_answer(response_text):
     # If no number found, return None
     return None
 
-# Batch processing function
-def process_batch(batch_prompts, batch_metadata, token_size):
-    """Process a batch of prompts for a given token size"""
-    results = []
+# Worker function for processing individual problem-token-run combinations
+def process_problem_run(args):
+    """Process a single problem with given token padding for a specific run"""
+    item, token_padding, problem_index, run_number = args
     
-    # Get cached content for this token size if applicable
-    cached_content_name = None
-    if context == 'math' and token_size >= 1024:
-        cache_key = f"{context}_{token_size}"
-        cached_content_name = cached_content_objects.get(cache_key)
+    problem_id = item['id']
+    problem = item['problem']
+    correct_answer = item['answer']
     
-    # Get client
+    # Get thread-local client
     client = get_client()
     
-    print(f"  Processing {len(batch_prompts)} prompts for token size {token_size}...")
-    
-    # Process all prompts in this batch
-    for i, (prompt, metadata) in enumerate(zip(batch_prompts, batch_metadata)):
-        try:
-            item = metadata['item']
-            problem_id = item['id']
-            problem = item['problem']
-            correct_answer = item['answer']
-            token_padding = metadata['token_padding']
-            problem_index = metadata['problem_index']
-            run_number = metadata['run_number']
-            
-            # Get model response with retry logic
-            model_response = make_api_call_with_retry(client, prompt, cached_content_name)
-            
-            # Extract answer
-            extracted_answer = extract_answer(model_response)
-            is_correct = str(extracted_answer) == str(correct_answer)
-            
-            result = {
-                'problem_id': problem_id,
-                'problem': problem,
-                'correct_answer': correct_answer,
-                'model_response': model_response,
-                'model_answer': extracted_answer,
-                'is_correct': is_correct,
-                'token_padding': token_padding,
-                'problem_index': problem_index,
-                'run_number': run_number,
-                'context': context,
-                'cached_content_used': cached_content_name is not None,
-                'error': None
-            }
-            
-            results.append(result)
-            
-            # Show progress within batch
-            if (i + 1) % 10 == 0 or (i + 1) == len(batch_prompts):
-                status_text = "✓" if result['is_correct'] else "✗"
-                print(f"    Batch progress: {i+1}/{len(batch_prompts)} | Problem {problem_index+1} Run {run_number} | {status_text}")
-            
-        except Exception as e:
-            error_msg = f"Failed after retries: {str(e)}"
-            logger.error(f"Problem {problem_id} with {token_size} tokens, run {run_number} failed: {error_msg}")
-            
-            results.append({
-                'problem_id': item['id'],
-                'problem': item['problem'],
-                'correct_answer': item['answer'],
-                'model_response': f"Error: {error_msg}",
-                'model_answer': None,
-                'is_correct': False,
-                'token_padding': token_padding,
-                'problem_index': metadata['problem_index'],
-                'run_number': metadata['run_number'],
-                'context': context,
-                'cached_content_used': False,
-                'error': error_msg
-            })
-    
-    print(f"  Completed batch for token size {token_size}")
-    return results
+    try:
+        # Create prompt
+        prompt = create_math_prompt(problem, token_padding)
+        
+        # Use pre-created cached content for math context
+        cached_content_name = None
+        if context == 'math' and token_padding >= 1024:
+            # Use the pre-created cache
+            cache_key = f"{context}_{token_padding}"
+            cached_content_name = cached_content_objects.get(cache_key)
+        
+        # Get model response with retry logic
+        model_response = make_api_call_with_retry(client, prompt, cached_content_name)
+        
+        # Extract answer
+        extracted_answer = extract_answer(model_response)
+        is_correct = str(extracted_answer) == str(correct_answer)
+        
+        result = {
+            'problem_id': problem_id,
+            'problem': problem,
+            'correct_answer': correct_answer,
+            'model_response': model_response,
+            'model_answer': extracted_answer,
+            'is_correct': is_correct,
+            'token_padding': token_padding,
+            'problem_index': problem_index,
+            'run_number': run_number,
+            'context': context,
+            'cached_content_used': cached_content_name is not None,
+            'error': None
+        }
+        
+        return result
+        
+    except Exception as e:
+        error_msg = f"Failed after retries: {str(e)}"
+        logger.error(f"Problem {problem_id} with {token_padding} tokens, run {run_number} failed: {error_msg}")
+        
+        return {
+            'problem_id': problem_id,
+            'problem': problem,
+            'correct_answer': correct_answer,
+            'model_response': f"Error: {error_msg}",
+            'model_answer': None,
+            'is_correct': False,
+            'token_padding': token_padding,
+            'problem_index': problem_index,
+            'run_number': run_number,
+            'context': context,
+            'cached_content_used': False,
+            'error': error_msg
+        }
 
 if __name__ == "__main__":
     try:
